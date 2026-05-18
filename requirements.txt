@@ -1,0 +1,5 @@
+flask>=3.0
+yt-dlp[default,curl-cffi]>=2025.1.15
+curl_cffi>=0.7
+requests>=2.31
+cloudscraper>=1.2.71
