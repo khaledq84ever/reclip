@@ -36,9 +36,9 @@ def _safe_filename(title, ext):
 
 def _ytdlp_info(url):
     cmd = ["yt-dlp", "--no-warnings", "--no-playlist", "--skip-download",
-           "--dump-single-json", "--geo-bypass", url]
+           "--dump-single-json", "--geo-bypass", "--impersonate", "chrome", url]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
         if proc.returncode != 0:
             msg = (proc.stderr or "").strip().splitlines()
             last = msg[-1] if msg else "Could not fetch snap info."
@@ -56,6 +56,7 @@ def _ytdlp_info(url):
 
 def _ytdlp_download(url, out_template, on_progress=None):
     cmd = ["yt-dlp", "--geo-bypass", "--no-playlist", "--newline",
+           "--impersonate", "chrome",
            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
            "--merge-output-format", "mp4",
            "-o", out_template, url]

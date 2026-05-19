@@ -50,12 +50,38 @@ def _scrape(url):
     """Try snapsave first (works for public FB videos), then yt-dlp."""
     data, err1 = _ig._snapsave_fetch(url)
     if data:
-        # snapsave returns video_url + thumb_url + title — reuse IG shape directly
+        # The IG parser stamps title="Instagram Post" as its fallback default —
+        # rewrite to a FB-shaped default so reclip's card isn't misleading.
+        if data.get("title") in (None, "", "Instagram Post"):
+            data["title"] = "Facebook video"
         return data, None
-    data2, err2 = _ig._ytdlp_fetch(url)
+    data2, err2 = _ytdlp_fetch_impersonate(url)
     if data2:
         return data2, None
     return None, err1 or err2 or "Could not fetch this Facebook video."
+
+
+def _ytdlp_fetch_impersonate(url):
+    """yt-dlp with --impersonate chrome (curl_cffi) — defeats FB's anti-bot."""
+    import json as _json
+    cmd = ["yt-dlp", "--dump-json", "--no-warnings", "--no-playlist",
+           "--impersonate", "chrome", url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+        if result.returncode == 0 and result.stdout.strip():
+            d = _json.loads(result.stdout)
+            return {
+                "video_url": d.get("url", ""),
+                "thumb_url": d.get("thumbnail", ""),
+                "title":     d.get("title") or "Facebook video",
+                "uploader":  d.get("uploader") or d.get("channel") or "",
+                "is_video":  d.get("ext", "") in ("mp4", "mov", "webm", "m4v"),
+            }, None
+        return None, (result.stderr.strip().splitlines() or ["yt-dlp failed"])[-1][:200]
+    except subprocess.TimeoutExpired:
+        return None, "yt-dlp timed out"
+    except Exception as e:
+        return None, str(e)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

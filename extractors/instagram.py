@@ -178,10 +178,13 @@ def _snapsave_fetch(url):
 
 def _ytdlp_fetch(url, cookies_file=None):
     try:
-        cmd = ["yt-dlp", "--dump-json", "--no-warnings", url]
+        # --impersonate chrome (via curl_cffi) is required on Railway/datacenter IPs:
+        # Instagram's anti-bot inspects TLS fingerprint + HTTP/2 frame ordering.
+        cmd = ["yt-dlp", "--dump-json", "--no-warnings", "--no-playlist",
+               "--impersonate", "chrome", url]
         if cookies_file and os.path.exists(cookies_file):
             cmd += ["--cookies", cookies_file]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
         if result.returncode == 0 and result.stdout.strip():
             data = json.loads(result.stdout)
             return {

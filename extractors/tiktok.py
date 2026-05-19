@@ -168,11 +168,14 @@ def _snaptik_info(url):
 
 def _ytdlp_info(url):
     try:
-        cmd = ["yt-dlp", "--dump-json", "--no-warnings", url]
+        # --impersonate chrome defeats TikTok's TLS-fingerprint IP block; without
+        # it datacenter IPs get "Your IP address is blocked from accessing this post".
+        cmd = ["yt-dlp", "--dump-json", "--no-warnings", "--no-playlist",
+               "--impersonate", "chrome", url]
         cf = os.environ.get("TIKTOK_COOKIE_FILE")
         if cf and os.path.exists(cf):
             cmd += ["--cookies", cf]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
         if result.returncode == 0 and result.stdout.strip():
             data = json.loads(result.stdout)
             return {
@@ -192,7 +195,7 @@ def _ytdlp_info(url):
 
 def _resolve(url):
     url = _normalize(url)
-    data, err = _tikwm_info(url)
+    data, err1 = _tikwm_info(url)
     if data:
         return data, None
     data, err2 = _ytdlp_info(url)
@@ -201,7 +204,9 @@ def _resolve(url):
     data, err3 = _snaptik_info(url)
     if data:
         return data, None
-    return None, err or err2 or err3 or "All TikTok download sources failed."
+    # Prefer yt-dlp's error since it usually explains *why* (IP block, removed
+    # post, etc.); tikwm's "msg" is often a terse "Free Api Limit" string.
+    return None, err2 or err3 or err1 or "All TikTok sources failed."
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

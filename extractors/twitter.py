@@ -95,8 +95,9 @@ def _fx_scrape(username, tweet_id):
 
 def _ytdlp_fetch(url):
     try:
-        cmd = ["yt-dlp", "--dump-json", "--no-warnings", url]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        cmd = ["yt-dlp", "--dump-json", "--no-warnings", "--no-playlist",
+               "--impersonate", "chrome", url]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
         if result.returncode == 0 and result.stdout.strip():
             d = json.loads(result.stdout)
             return {
