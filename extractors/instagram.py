@@ -141,39 +141,49 @@ def _parse_snapsave_html(decoded):
             "uploader": "", "is_video": False}
 
 
-def _snapsave_fetch(url):
-    try:
+def _snapsave_fetch(url, attempts=3):
+    """Retry snapsave up to N times. Their backend pool rotates — when one
+    proxy can't reach IG, a retry seconds later often hits a different one."""
+    import time as _time
+    last_err = None
+    for i in range(attempts):
         try:
-            import cloudscraper
-            sess = cloudscraper.create_scraper(
-                browser={"browser": "chrome", "platform": "windows", "mobile": False})
-        except ImportError:
-            sess = req_lib.Session()
-            sess.headers.update({"User-Agent":
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"})
-        sess.get("https://snapsave.app/", timeout=15)
-        r = sess.post(
-            "https://snapsave.app/action.php?lang=en",
-            data={"url": url},
-            headers={"Origin": "https://snapsave.app",
-                     "Referer": "https://snapsave.app/",
-                     "X-Requested-With": "XMLHttpRequest",
-                     "Accept": "*/*"},
-            timeout=25)
-        if r.status_code != 200 or not r.text:
-            return None, f"snapsave HTTP {r.status_code}"
-        decoded = _snapsave_decode(r.text)
-        if not decoded:
-            return None, "Could not decode snapsave response."
-        if "Unable to connect" in decoded or '"error_' in decoded:
-            return None, "snapsave could not reach Instagram for this post."
-        parsed = _parse_snapsave_html(decoded)
-        if not parsed:
-            return None, "No download links found in snapsave response."
-        return parsed, None
-    except Exception as e:
-        return None, f"snapsave error: {e}"
+            try:
+                import cloudscraper
+                sess = cloudscraper.create_scraper(
+                    browser={"browser": "chrome", "platform": "windows", "mobile": False})
+            except ImportError:
+                sess = req_lib.Session()
+                sess.headers.update({"User-Agent":
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"})
+            sess.get("https://snapsave.app/", timeout=15)
+            r = sess.post(
+                "https://snapsave.app/action.php?lang=en",
+                data={"url": url},
+                headers={"Origin": "https://snapsave.app",
+                         "Referer": "https://snapsave.app/",
+                         "X-Requested-With": "XMLHttpRequest",
+                         "Accept": "*/*"},
+                timeout=25)
+            if r.status_code != 200 or not r.text:
+                last_err = f"snapsave HTTP {r.status_code}"
+            else:
+                decoded = _snapsave_decode(r.text)
+                if not decoded:
+                    last_err = "Could not decode snapsave response."
+                elif "Unable to connect" in decoded or '"error_' in decoded:
+                    last_err = "snapsave's proxy pool currently can't reach Instagram."
+                else:
+                    parsed = _parse_snapsave_html(decoded)
+                    if parsed:
+                        return parsed, None
+                    last_err = "No download links in snapsave response."
+        except Exception as e:
+            last_err = f"snapsave error: {e}"
+        if i < attempts - 1:
+            _time.sleep(4 + i * 3)  # 4s, 7s, 10s backoff
+    return None, last_err or "snapsave failed."
 
 
 def _ytdlp_fetch(url, cookies_file=None):
@@ -379,7 +389,14 @@ def _scrape(url):
         errors.append(f"{name}: {err}")
         print(f"[instagram] {name} failed: {err}", flush=True)
 
-    return None, errors[-1] if errors else "All Instagram strategies failed."
+    # All 4 strategies failed. Give the user a clearer message than yt-dlp's
+    # raw error — IG is hard from datacenter IPs when post is non-public or
+    # all proxy pools are rate-limited. Keep the strategy log for diagnostics.
+    print(f"[instagram] all strategies failed: {' | '.join(errors)}", flush=True)
+    return None, ("Instagram is currently blocking this download. "
+                  "The post may be private, age-restricted, or our proxy "
+                  "providers are temporarily rate-limited. Please try again "
+                  "in a few minutes.")
 
 
 # ── Public API used by reclip ────────────────────────────────────────────────
