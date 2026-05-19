@@ -54,67 +54,119 @@ _VID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/live/|/embed/)([A-Za-z0-9_-]{1
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 
-# ── y2mate.nu / iotacloud.org trick — primary YouTube MP3 path ────────────────
-# Reverse-engineered: the conversion page loads y2mate.js with a base64 data-key.
-# That decodes to a Bearer token for https://iotacloud.org/api/. A GET returns
-# JSON like {progress:"completed", title, url} where `url` is a direct MP3
-# attachment URL.
+# ── y2mate.nu / etacloud.org trick — handles BOTH MP3 AND MP4 ────────────────
+# Reverse-engineered from https://v3.y2mate.nu/js/.../y2mate.js
+# Flow (one stateful session):
+#   1) GET v3.y2mate.nu/ → scrape `data-key="<base64>"` → bearer token
+#   2) GET https://eta.etacloud.org/api/v1/init  (Auth: Bearer)        → convertURL
+#   3) GET <convertURL>&v=<vid>&f=<mp3|mp4>     (handle redirect=1)    → progressURL + downloadURL
+#   4) Poll <progressURL> until progress >= 3
+#   5) GET <downloadURL>&v=<vid>&f=<fmt>&r=y2mate.nu — streams the file
+# IMPORTANT: steps 3–5 must use the SAME requests.Session (cookies + bearer);
+# the signed URLs expire / 403 if you switch sessions.
 
 import base64 as _b64
 import time as _time
 
-def _y2mate_scrape_key(vid):
-    """Scrape the per-page bearer key from v3.y2mate.nu/mp3/<vid>/."""
+_Y2MATE_PAGE = "https://v3.y2mate.nu/"
+_Y2MATE_ENDPOINT = "etacloud.org"
+
+
+def _y2mate_session():
+    """Returns (requests.Session, bearer) or (None, None)."""
     import requests as _rq
+    s = _rq.Session()
+    s.headers.update({"User-Agent": _UA})
     try:
-        r = _rq.get(f"https://v3.y2mate.nu/mp3/{vid}/",
-                    headers={"User-Agent": _UA}, timeout=12)
+        r = s.get(_Y2MATE_PAGE, timeout=15)
         if r.status_code != 200:
-            return None
+            return None, None
         m = re.search(r'data-key="([^"]+)"', r.text)
         if not m:
-            return None
-        return _b64.b64decode(m.group(1)).decode("ascii", errors="ignore")
+            return None, None
+        bearer = _b64.b64decode(m.group(1)).decode("ascii", errors="ignore")
+        return s, bearer
     except Exception:
-        return None
+        return None, None
 
 
-def _y2mate_mp3(vid, max_rounds=6):
-    """Hit iotacloud.org/api/ with the scraped bearer until the conversion
-    completes (or errors out). Returns (direct_url, title) or (None, err_str)."""
-    import requests as _rq
-    bearer = _y2mate_scrape_key(vid)
-    if not bearer:
-        return None, "y2mate: could not scrape data-key"
-    headers = {
+def _y2mate_hdr(bearer):
+    return {
         "Authorization": f"Bearer {bearer}",
-        "Origin": "https://v3.y2mate.nu",
-        "Referer": "https://v3.y2mate.nu/",
-        "User-Agent": _UA,
+        "Origin": _Y2MATE_PAGE.rstrip("/"),
+        "Referer": _Y2MATE_PAGE,
     }
-    for r in range(1, max_rounds + 1):
+
+
+def _y2mate_resolve(vid, fmt):
+    """Run init → convert → poll. Returns (session, download_url, title) or
+    raises on error. fmt is 'mp3' or 'mp4'. Caller must use the returned
+    session to fetch download_url within ~1 minute."""
+    s, bearer = _y2mate_session()
+    if not s:
+        raise RuntimeError("y2mate: could not scrape bearer")
+    hdr = _y2mate_hdr(bearer)
+
+    # init
+    ts = int(_time.time())
+    r = s.get(f"https://eta.{_Y2MATE_ENDPOINT}/api/v1/init?_={ts}",
+              headers=hdr, timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(f"y2mate init HTTP {r.status_code}")
+    init = r.json()
+    if int(init.get("error") or 0):
+        raise RuntimeError(f"y2mate init error={init['error']}")
+    convert_url = init["convertURL"]
+
+    # convert (follow up to 3 redirects)
+    cd = None
+    for _ in range(3):
         ts = int(_time.time())
-        try:
-            resp = _rq.get(
-                f"https://iotacloud.org/api/?r={r}&v={vid}&_={ts}",
-                headers=headers, timeout=20,
-            )
-        except Exception as e:
-            return None, f"y2mate round {r} network: {e}"
-        if resp.status_code != 200:
-            return None, f"y2mate HTTP {resp.status_code}"
-        try:
-            d = resp.json()
-        except Exception:
-            return None, "y2mate: non-JSON response"
-        prog = d.get("progress")
-        if prog == "completed" and d.get("url"):
-            return (d["url"], d.get("title") or ""), None
-        if prog == "error":
-            return None, "y2mate: backend reported error"
-        # "converting" or other — wait then retry
-        _time.sleep(4 if r < 3 else 6)
-    return None, "y2mate: still converting after retries"
+        r = s.get(f"{convert_url}&v={vid}&f={fmt}&_={ts}",
+                  headers=hdr, timeout=20)
+        if r.status_code != 200:
+            raise RuntimeError(f"y2mate convert HTTP {r.status_code}")
+        cd = r.json()
+        if int(cd.get("error") or 0):
+            raise RuntimeError(f"y2mate convert error={cd['error']}")
+        if cd.get("redirect") == 1:
+            convert_url = cd["redirectURL"]
+            continue
+        break
+    if not cd or "progressURL" not in cd or "downloadURL" not in cd:
+        raise RuntimeError("y2mate convert: no progressURL/downloadURL")
+
+    progress_url = cd["progressURL"]
+    download_url = cd["downloadURL"]
+    title = cd.get("title", "")
+
+    # poll until progress >= 3 (etacloud's "done" state)
+    deadline = _time.time() + 90
+    while _time.time() < deadline:
+        ts = int(_time.time())
+        pr = s.get(f"{progress_url}&_={ts}", headers=hdr, timeout=15)
+        if pr.status_code != 200:
+            raise RuntimeError(f"y2mate progress HTTP {pr.status_code}")
+        pd = pr.json()
+        if int(pd.get("error") or 0):
+            raise RuntimeError(f"y2mate progress error={pd['error']}")
+        if pd.get("title"):
+            title = pd["title"]
+        if int(pd.get("progress", 0) or 0) >= 3:
+            # Final download URL includes v= f= r= query params.
+            final = f"{download_url}&v={vid}&f={fmt}&r=y2mate.nu"
+            return s, final, title
+        _time.sleep(3)
+    raise RuntimeError("y2mate: conversion timeout")
+
+
+def _y2mate_grab(vid, fmt):
+    """Compat wrapper. Returns ((session, final_url, title), None) on success,
+    (None, error_str) on failure."""
+    try:
+        return _y2mate_resolve(vid, fmt), None
+    except Exception as e:
+        return None, str(e)
 
 
 def is_valid_url(url):
@@ -344,33 +396,51 @@ def _stream_to_file(src_url, dest_path, on_progress=None):
                     on_progress(min(int(done / total * 85), 85))
 
 
+def _y2mate_stream(session, url, dest_path, on_progress=None):
+    """Stream a y2mate signed-download URL to disk using the session that
+    minted it (cookies + bearer must match). Updates progress 10..95."""
+    r = session.get(url, stream=True, timeout=120,
+                    headers={"User-Agent": _UA, "Referer": _Y2MATE_PAGE})
+    r.raise_for_status()
+    total = int(r.headers.get("content-length", 0))
+    done = 0
+    with open(dest_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=128 * 1024):
+            if chunk:
+                f.write(chunk)
+                done += len(chunk)
+                if total and on_progress:
+                    on_progress(min(10 + int(done / total * 85), 95))
+
+
 def download(url, fmt, dest_dir, on_progress=None):
     vid = _extract_video_id(url)
     if not vid:
         return None, None, "Could not parse YouTube URL."
 
-    # ── PRIMARY (audio): y2mate.nu / iotacloud.org direct-link trick ──────────
-    # Fast, reliable, no bot-check. Only handles MP3 — for video we fall
-    # through to Invidious / yt-dlp.
-    if fmt == "audio":
-        if on_progress: on_progress(5)
-        res, err = _y2mate_mp3(vid)
-        if res:
-            direct_url, title = res
-            file_id = uuid.uuid4().hex[:12]
-            mp3 = os.path.join(dest_dir, f"{file_id}.mp3")
+    # ── PRIMARY: y2mate.nu / etacloud.org trick — handles BOTH mp3 AND mp4 ────
+    # No proxy, no cookies, no bgutil. The y2mate backend does the YouTube
+    # extraction for us, so this works even when Railway's IP is bot-blocked.
+    y_fmt = "mp3" if fmt == "audio" else "mp4"
+    if on_progress: on_progress(5)
+    res, err = _y2mate_grab(vid, y_fmt)
+    if res:
+        session, dl_url, title = res
+        file_id = uuid.uuid4().hex[:12]
+        out = os.path.join(dest_dir, f"{file_id}.{y_fmt}")
+        try:
+            _y2mate_stream(session, dl_url, out, on_progress=on_progress)
+        except Exception as e:
+            print(f"[youtube] y2mate stream failed: {e}; falling through", flush=True)
             try:
-                _stream_to_file(direct_url, mp3,
-                                on_progress=lambda p: on_progress and on_progress(10 + int(p * 0.9)))
-            except Exception as e:
-                # y2mate URLs are sometimes IP-bound; on failure fall through
-                # to the Invidious/yt-dlp paths below.
-                print(f"[youtube] y2mate stream failed: {e}; falling through", flush=True)
-            else:
-                if on_progress: on_progress(100)
-                return mp3, _safe_filename(title or "youtube", "mp3"), None
+                if os.path.exists(out): os.remove(out)
+            except Exception: pass
         else:
-            print(f"[youtube] y2mate path failed: {err}; falling through", flush=True)
+            if os.path.exists(out) and os.path.getsize(out) >= 1024:
+                if on_progress: on_progress(100)
+                return out, _safe_filename(title or "youtube", y_fmt), None
+    else:
+        print(f"[youtube] y2mate path failed: {err}; falling through", flush=True)
 
     # Full Invidious response — need adaptiveFormats for stream URLs.
     iv = _invidious_race(vid, fields=("title", "author", "adaptiveFormats"),
