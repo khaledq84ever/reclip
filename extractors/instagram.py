@@ -141,6 +141,82 @@ def _parse_snapsave_html(decoded):
             "uploader": "", "is_video": False}
 
 
+# ── snapinsta.to (different operator from snapsave.app, separate proxy pool) ──
+# Discovered 2026-05-19 when snapsave was down. Flow:
+#   1) GET /en2 (cloudscraper handles CF, warms cookies)
+#   2) POST /api/userverify {url} → {success, token: "JWT...."}
+#   3) POST /api/ajaxSearch {q, t, v, lang, cftoken, html} → HTML payload
+#      with the same .download-items structure as snapsave (icon-dlvideo /
+#      icon-dlimage). Final media URLs come back as dl.snapcdn.app/get?token=
+#      proxies — snapinsta's CDN un-wraps to the real IG URL.
+
+def _snapinsta_fetch(url):
+    try:
+        try:
+            import cloudscraper
+            sess = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False})
+        except ImportError:
+            return None, "cloudscraper required for snapinsta"
+
+        sess.get("https://snapinsta.to/en2", timeout=20)
+
+        # Step 1: JWT from /api/userverify
+        r = sess.post(
+            "https://snapinsta.to/api/userverify",
+            data={"url": url},
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": "https://snapinsta.to",
+                "Referer": "https://snapinsta.to/en2",
+                "Accept": "application/json",
+            }, timeout=20)
+        if r.status_code != 200:
+            return None, f"snapinsta verify HTTP {r.status_code}"
+        try:
+            token = (r.json() or {}).get("token")
+        except Exception:
+            return None, "snapinsta verify: non-JSON"
+        if not token:
+            return None, "snapinsta verify returned no token"
+
+        # Step 2: ajaxSearch with the JWT as cftoken
+        r2 = sess.post(
+            "https://snapinsta.to/api/ajaxSearch",
+            data={"q": url, "t": "media", "v": "7", "lang": "en",
+                  "cftoken": token, "html": ""},
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": "https://snapinsta.to",
+                "Referer": "https://snapinsta.to/en2",
+                "Accept": "*/*",
+            }, timeout=30)
+        if r2.status_code != 200:
+            return None, f"snapinsta search HTTP {r2.status_code}"
+        try:
+            body = r2.json()
+        except Exception:
+            return None, "snapinsta search: non-JSON"
+
+        if body.get("status") != "ok":
+            return None, body.get("mess", "snapinsta unknown error")
+        if body.get("mess") and not body.get("data"):
+            # snapinsta returns mess+data="error..." for private/deleted posts
+            return None, "snapinsta: post unavailable (private/deleted)"
+        html = body.get("data") or ""
+        if not html:
+            return None, "snapinsta: empty data"
+
+        # The HTML uses the exact same .download-items + icon-dlvideo / dlimage
+        # structure as snapsave — reuse the parser.
+        parsed = _parse_snapsave_html(html)
+        if not parsed:
+            return None, "snapinsta: could not parse download HTML"
+        return parsed, None
+    except Exception as e:
+        return None, f"snapinsta error: {e}"
+
+
 def _snapsave_fetch(url, attempts=3):
     """Retry snapsave up to N times. Their backend pool rotates — when one
     proxy can't reach IG, a retry seconds later often hits a different one."""
@@ -373,12 +449,22 @@ def _scrape(url):
     # snapsave (when working), then yt-dlp last.
     errors = []
 
+    # Canonical URLs: try /reel/ first for reels (some converters detect type
+    # by URL path), then /p/ as a fallback.
+    canon_reel = f"https://www.instagram.com/reel/{sc}/"
+    canon_p    = f"https://www.instagram.com/p/{sc}/"
+
+    def _try_snapinsta():
+        d, e = _snapinsta_fetch(canon_reel)
+        if d: return d, None
+        return _snapinsta_fetch(canon_p)
+
     for name, fn in [
+        ("snapinsta",  _try_snapinsta),
         ("ig_web_api", lambda: _ig_web_api(sc)),
         ("ig_graphql", lambda: _ig_graphql(sc)),
-        ("snapsave",   lambda: _snapsave_fetch(f"https://www.instagram.com/p/{sc}/")),
-        ("yt-dlp",     lambda: _ytdlp_fetch(f"https://www.instagram.com/p/{sc}/",
-                                            os.environ.get("INSTA_COOKIE_FILE"))),
+        ("snapsave",   lambda: _snapsave_fetch(canon_p)),
+        ("yt-dlp",     lambda: _ytdlp_fetch(canon_p, os.environ.get("INSTA_COOKIE_FILE"))),
     ]:
         try:
             data, err = fn()
