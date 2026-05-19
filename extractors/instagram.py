@@ -150,71 +150,112 @@ def _parse_snapsave_html(decoded):
 #      icon-dlimage). Final media URLs come back as dl.snapcdn.app/get?token=
 #      proxies — snapinsta's CDN un-wraps to the real IG URL.
 
-def _snapinsta_fetch(url):
+_SNAPINSTA_BROWSERS = [
+    {"browser": "chrome",  "platform": "windows", "mobile": False},
+    {"browser": "firefox", "platform": "windows", "mobile": False},
+    {"browser": "chrome",  "platform": "darwin",  "mobile": False},
+    {"browser": "chrome",  "platform": "android", "mobile": True},
+]
+
+
+def _snapinsta_fetch(url, attempts=4):
+    """One full attempt at snapinsta.to. Tries multiple cloudscraper browser
+    fingerprints since Railway's IP is sometimes 403'd on a specific UA combo
+    but accepted on another. Each attempt does the full warm → verify → search
+    chain because the JWT is bound to one session."""
     try:
+        import cloudscraper
+    except ImportError:
+        return None, "cloudscraper not installed"
+
+    import time as _t
+    last_err = "snapinsta: no attempt"
+
+    for i in range(attempts):
+        browser_cfg = _SNAPINSTA_BROWSERS[i % len(_SNAPINSTA_BROWSERS)]
         try:
-            import cloudscraper
-            sess = cloudscraper.create_scraper(
-                browser={"browser": "chrome", "platform": "windows", "mobile": False})
-        except ImportError:
-            return None, "cloudscraper required for snapinsta"
+            sess = cloudscraper.create_scraper(browser=browser_cfg)
+            # Real-browser headers Cloudflare's bot scoring looks for
+            sec_fetch = {
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-CH-UA-Mobile": "?1" if browser_cfg.get("mobile") else "?0",
+                "Sec-CH-UA-Platform": f'"{browser_cfg["platform"].title()}"',
+            }
 
-        sess.get("https://snapinsta.to/en2", timeout=20)
+            r = sess.get("https://snapinsta.to/en2", timeout=20,
+                         headers={"Sec-Fetch-Site": "none",
+                                  "Sec-Fetch-Mode": "navigate",
+                                  "Sec-Fetch-Dest": "document"})
+            if r.status_code != 200:
+                last_err = f"snapinsta home HTTP {r.status_code}"
+                _t.sleep(1 + i)
+                continue
 
-        # Step 1: JWT from /api/userverify
-        r = sess.post(
-            "https://snapinsta.to/api/userverify",
-            data={"url": url},
-            headers={
-                "X-Requested-With": "XMLHttpRequest",
-                "Origin": "https://snapinsta.to",
-                "Referer": "https://snapinsta.to/en2",
-                "Accept": "application/json",
-            }, timeout=20)
-        if r.status_code != 200:
-            return None, f"snapinsta verify HTTP {r.status_code}"
-        try:
-            token = (r.json() or {}).get("token")
-        except Exception:
-            return None, "snapinsta verify: non-JSON"
-        if not token:
-            return None, "snapinsta verify returned no token"
+            r = sess.post(
+                "https://snapinsta.to/api/userverify",
+                data={"url": url},
+                headers={
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": "https://snapinsta.to",
+                    "Referer": "https://snapinsta.to/en2",
+                    "Accept": "application/json, text/plain, */*",
+                    **sec_fetch,
+                }, timeout=20)
+            if r.status_code != 200:
+                last_err = f"snapinsta verify HTTP {r.status_code}"
+                _t.sleep(1 + i)
+                continue
+            try:
+                token = (r.json() or {}).get("token")
+            except Exception:
+                last_err = "snapinsta verify: non-JSON"
+                continue
+            if not token:
+                last_err = "snapinsta verify: no token in response"
+                continue
 
-        # Step 2: ajaxSearch with the JWT as cftoken
-        r2 = sess.post(
-            "https://snapinsta.to/api/ajaxSearch",
-            data={"q": url, "t": "media", "v": "7", "lang": "en",
-                  "cftoken": token, "html": ""},
-            headers={
-                "X-Requested-With": "XMLHttpRequest",
-                "Origin": "https://snapinsta.to",
-                "Referer": "https://snapinsta.to/en2",
-                "Accept": "*/*",
-            }, timeout=30)
-        if r2.status_code != 200:
-            return None, f"snapinsta search HTTP {r2.status_code}"
-        try:
-            body = r2.json()
-        except Exception:
-            return None, "snapinsta search: non-JSON"
+            r2 = sess.post(
+                "https://snapinsta.to/api/ajaxSearch",
+                data={"q": url, "t": "media", "v": "7", "lang": "en",
+                      "cftoken": token, "html": ""},
+                headers={
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": "https://snapinsta.to",
+                    "Referer": "https://snapinsta.to/en2",
+                    "Accept": "*/*",
+                    **sec_fetch,
+                }, timeout=30)
+            if r2.status_code != 200:
+                last_err = f"snapinsta search HTTP {r2.status_code}"
+                continue
+            try:
+                body = r2.json()
+            except Exception:
+                last_err = "snapinsta search: non-JSON"
+                continue
 
-        if body.get("status") != "ok":
-            return None, body.get("mess", "snapinsta unknown error")
-        if body.get("mess") and not body.get("data"):
-            # snapinsta returns mess+data="error..." for private/deleted posts
-            return None, "snapinsta: post unavailable (private/deleted)"
-        html = body.get("data") or ""
-        if not html:
-            return None, "snapinsta: empty data"
+            if body.get("status") != "ok":
+                last_err = body.get("mess", "snapinsta unknown error")
+                # "Video is private" / "Invalid token" — won't get better next try
+                if "private" in last_err.lower() or "invalid" in last_err.lower():
+                    return None, last_err
+                continue
+            html = body.get("data") or ""
+            if not html:
+                last_err = body.get("mess") or "snapinsta empty data"
+                continue
 
-        # The HTML uses the exact same .download-items + icon-dlvideo / dlimage
-        # structure as snapsave — reuse the parser.
-        parsed = _parse_snapsave_html(html)
-        if not parsed:
-            return None, "snapinsta: could not parse download HTML"
-        return parsed, None
-    except Exception as e:
-        return None, f"snapinsta error: {e}"
+            parsed = _parse_snapsave_html(html)
+            if parsed:
+                return parsed, None
+            last_err = "snapinsta: could not parse download HTML"
+        except Exception as e:
+            last_err = f"snapinsta error: {e}"
+            _t.sleep(1 + i)
+
+    return None, last_err
 
 
 def _snapsave_fetch(url, attempts=3):
