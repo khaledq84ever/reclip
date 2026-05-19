@@ -401,7 +401,11 @@ def get_info():
         normalized, err = _proxy_info(cfg, url)
         if normalized:
             return jsonify(normalized)
-        # else: log and continue to local yt-dlp as a fallback
+        # Instagram's extractor already includes yt-dlp as its 4th cascade
+        # strategy — re-running it at the router level just clobbers the
+        # extractor's user-facing error with yt-dlp's noisy traceback.
+        if key == "instagram":
+            return jsonify({"error": err or "Instagram fetch failed."}), 400
         print(f"[router] {cfg['name']} backend failed ({err}); falling back to yt-dlp", flush=True)
 
     cmd = ["yt-dlp", "--no-playlist", "-j"] + yt_dlp_base_args(url) + [url]
@@ -461,6 +465,10 @@ def start_download():
         if local_id:
             jobs[local_id]["title"] = title
             return jsonify({"job_id": local_id})
+        # Same rationale as /api/info above — IG extractor already runs yt-dlp
+        # internally; the second pass at router level just hides the real msg.
+        if _key == "instagram":
+            return jsonify({"error": err or "Instagram fetch failed."}), 400
         print(f"[router] {cfg['name']} /start failed ({err}); falling back to yt-dlp", flush=True)
 
     job_id = uuid.uuid4().hex[:10]
