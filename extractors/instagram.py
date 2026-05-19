@@ -201,18 +201,185 @@ def _ytdlp_fetch(url, cookies_file=None):
         return None, f"yt-dlp error: {e}"
 
 
+# ── Direct Instagram public endpoints (no third-party site) ──────────────────
+# Two well-known tricks for fetching public IG posts without login:
+#   1) /api/v1/media/<media_id>/info/ with X-IG-App-ID header (mobile-app proxy)
+#   2) GraphQL query_hash for shortcode_media (public iframe data)
+# These work from datacenter IPs when the post is public — no proxy, no cookies.
+
+_IG_APP_ID = "936619743392459"   # public web App ID (same one ig.com sends)
+_IG_ASBD_ID = "129477"
+_IG_ALPHA = ("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+             "abcdefghijklmnopqrstuvwxyz0123456789-_")
+
+
+def _shortcode_to_media_id(sc):
+    n = 0
+    for ch in sc:
+        i = _IG_ALPHA.find(ch)
+        if i < 0:
+            return None
+        n = n * 64 + i
+    return n
+
+
+def _ig_extract_from_media_obj(m):
+    """Normalize IG's `xdt_shortcode_media` / `items[0]` object → reclip dict."""
+    if not m:
+        return None
+    # video_versions[].url or video_url; image_versions2 has display thumb
+    video_url = ""
+    if m.get("video_versions"):
+        # Sorted high→low quality; first is best
+        video_url = m["video_versions"][0].get("url") or ""
+    elif m.get("video_url"):
+        video_url = m["video_url"]
+
+    thumb = ""
+    iv = m.get("image_versions2") or {}
+    if iv.get("candidates"):
+        thumb = iv["candidates"][0].get("url") or ""
+    elif m.get("display_url"):
+        thumb = m["display_url"]
+    elif m.get("thumbnail_url"):
+        thumb = m["thumbnail_url"]
+
+    is_video = bool(video_url) or bool(m.get("is_video"))
+    user = (m.get("user") or {}).get("username") \
+           or (m.get("owner") or {}).get("username") \
+           or ""
+    caption_obj = m.get("caption") or (m.get("edge_media_to_caption", {})
+                                       .get("edges", [{}])[0]
+                                       .get("node", {}) if m.get("edge_media_to_caption") else {})
+    if isinstance(caption_obj, dict):
+        caption = caption_obj.get("text", "")
+    else:
+        caption = str(caption_obj or "")
+    title = (caption or "Instagram Post").strip()[:120] or "Instagram Post"
+
+    if not video_url and not thumb:
+        return None
+    return {
+        "video_url": video_url,
+        "thumb_url": thumb,
+        "title":     title,
+        "uploader":  user,
+        "is_video":  is_video,
+    }
+
+
+def _ig_web_api(shortcode):
+    """Hit IG's web v1 endpoint: /api/v1/media/<id>/info/ with X-IG-App-ID.
+    No login required for public posts. Works from datacenter IPs."""
+    mid = _shortcode_to_media_id(shortcode)
+    if not mid:
+        return None, "Could not encode shortcode."
+    try:
+        try:
+            import cloudscraper
+            sess = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False})
+        except ImportError:
+            sess = req_lib.Session()
+        hdrs = {
+            "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept":          "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-IG-App-ID":     _IG_APP_ID,
+            "X-ASBD-ID":       _IG_ASBD_ID,
+            "X-IG-WWW-Claim":  "0",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin":   "https://www.instagram.com",
+            "Referer":  f"https://www.instagram.com/p/{shortcode}/",
+        }
+        r = sess.get(
+            f"https://www.instagram.com/api/v1/media/{mid}/info/",
+            headers=hdrs, timeout=20)
+        if r.status_code != 200:
+            return None, f"IG web v1 HTTP {r.status_code}"
+        try:
+            d = r.json()
+        except Exception:
+            return None, "IG web v1: non-JSON response (likely login wall)"
+        items = d.get("items") or []
+        if not items:
+            return None, "IG web v1: no items"
+        info = _ig_extract_from_media_obj(items[0])
+        if not info:
+            return None, "IG web v1: could not extract media"
+        return info, None
+    except Exception as e:
+        return None, f"IG web v1 error: {e}"
+
+
+def _ig_graphql(shortcode):
+    """Older public GraphQL endpoint — falls back when v1 is rate-limited."""
+    try:
+        sess = req_lib.Session()
+        hdrs = {
+            "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept": "*/*",
+            "X-IG-App-ID":  _IG_APP_ID,
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin":  "https://www.instagram.com",
+            "Referer": f"https://www.instagram.com/p/{shortcode}/",
+        }
+        # The "PolarisPostActionLoadPostQueryQuery" GraphQL doc shipped publicly.
+        # Fall back to plain shortcode lookup which returns shortcode_media.
+        r = sess.get(
+            "https://www.instagram.com/graphql/query/",
+            params={
+                "doc_id":    "8845758582119845",   # public PostPage query
+                "variables": '{"shortcode":"%s"}' % shortcode,
+            },
+            headers=hdrs, timeout=20)
+        if r.status_code != 200:
+            return None, f"IG graphql HTTP {r.status_code}"
+        try:
+            d = r.json()
+        except Exception:
+            return None, "IG graphql: non-JSON"
+        m = (d.get("data") or {}).get("xdt_shortcode_media") \
+            or (d.get("data") or {}).get("shortcode_media")
+        info = _ig_extract_from_media_obj(m)
+        if not info:
+            return None, "IG graphql: no media"
+        return info, None
+    except Exception as e:
+        return None, f"IG graphql error: {e}"
+
+
 def _scrape(url):
     sc = extract_shortcode(url)
     if not sc:
         return None, "Could not parse Instagram URL."
-    canon = f"https://www.instagram.com/p/{sc}/"
-    data, err1 = _snapsave_fetch(canon)
-    if data:
-        return data, None
-    data, err2 = _ytdlp_fetch(canon, os.environ.get("INSTA_COOKIE_FILE"))
-    if data:
-        return data, None
-    return None, err1 or err2 or "Could not fetch this post."
+
+    # Strategy cascade — first one that returns wins. Each strategy uses a
+    # different trick: direct IG public endpoints first (most reliable), then
+    # snapsave (when working), then yt-dlp last.
+    errors = []
+
+    for name, fn in [
+        ("ig_web_api", lambda: _ig_web_api(sc)),
+        ("ig_graphql", lambda: _ig_graphql(sc)),
+        ("snapsave",   lambda: _snapsave_fetch(f"https://www.instagram.com/p/{sc}/")),
+        ("yt-dlp",     lambda: _ytdlp_fetch(f"https://www.instagram.com/p/{sc}/",
+                                            os.environ.get("INSTA_COOKIE_FILE"))),
+    ]:
+        try:
+            data, err = fn()
+        except Exception as e:
+            data, err = None, f"{name} crashed: {e}"
+        if data and (data.get("video_url") or data.get("thumb_url")):
+            return data, None
+        errors.append(f"{name}: {err}")
+        print(f"[instagram] {name} failed: {err}", flush=True)
+
+    return None, errors[-1] if errors else "All Instagram strategies failed."
 
 
 # ── Public API used by reclip ────────────────────────────────────────────────
