@@ -169,6 +169,31 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/robots.txt")
+def robots():
+    body = ("User-agent: *\n"
+            "Allow: /\n\n"
+            "Sitemap: https://reclip.up.railway.app/sitemap.xml\n")
+    return body, 200, {"Content-Type": "text/plain"}
+
+
+@app.route("/sitemap.xml")
+def sitemap():
+    today = time.strftime("%Y-%m-%d")
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        '  <url>\n'
+        '    <loc>https://reclip.up.railway.app/</loc>\n'
+        f'    <lastmod>{today}</lastmod>\n'
+        '    <changefreq>weekly</changefreq>\n'
+        '    <priority>1.0</priority>\n'
+        '  </url>\n'
+        '</urlset>\n'
+    )
+    return xml, 200, {"Content-Type": "application/xml"}
+
+
 @app.route("/debug/yt")
 def debug_yt():
     """Probe each Invidious instance from inside the container to see which are
